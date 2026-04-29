@@ -50,9 +50,17 @@ class TinyModel(torch.nn.Module):
                 else:
                     torch.nn.init.zeros_(param)
 
-    def forward(self, input_ids: torch.Tensor) -> object:
+    def forward(self, input_ids: torch.Tensor, **kwargs: Any) -> object:
+        use_cache = kwargs.get("use_cache", False)
+        past_kv = kwargs.get("past_key_values", None)
         hidden = self.embed(input_ids)
         logits = self.proj(hidden)
+        if use_cache:
+            bsz, seq = input_ids.shape
+            past_len = past_kv[0][0].shape[2] if past_kv is not None else 0
+            k = torch.zeros(bsz, 1, past_len + seq, 1, device=input_ids.device)
+            v = torch.zeros(bsz, 1, past_len + seq, 1, device=input_ids.device)
+            return type("Output", (), {"logits": logits, "past_key_values": ((k, v),)})()
         return type("Output", (), {"logits": logits})()
 
 

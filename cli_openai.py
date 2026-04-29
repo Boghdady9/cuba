@@ -68,6 +68,12 @@ def main() -> None:
         type=int,
         default=int(os.environ.get("CUBA_SCHEDULER_TICK_MS", "5")),
     )
+    p.add_argument(
+        "--device",
+        default=os.environ.get("CUBA_DEVICE", "auto"),
+        choices=["auto", "cpu", "cuda", "mps", "mlx"],
+        help="Compute device. auto detects cuda > mps > cpu (or mlx on Apple Silicon if installed). Env: CUBA_DEVICE",
+    )
     p.add_argument("--torch-num-threads", type=int, default=None)
     p.add_argument("--torch-interop-threads", type=int, default=None)
     args = p.parse_args()
@@ -103,6 +109,7 @@ def main() -> None:
             scheduler_tick_ms=int(args.scheduler_tick_ms),
             num_threads=args.torch_num_threads,
             interop_threads=args.torch_interop_threads,
+            device=str(args.device),
         )
     )
     app = create_app(

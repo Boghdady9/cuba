@@ -1,14 +1,11 @@
 """
-Interactive terminal chat against a Cuba OpenAI-compatible server.
+Interactive terminal chat against a Cuba OpenAI-compatible server (streaming).
 
   uv run python examples/chat_terminal.py
 
 If ``CUBA_CHAT_URL`` is not set, the client probes ``/health`` on (by default)::
 
   http://127.0.0.1:8000  then  http://127.0.0.1:8080
-
-Whichever answers first is used; 8000 matches ``cli_openai.py`` default, 8080 matches
-a typical ``kubectl port-forward ... 8080:80``.
 
 Set explicitly when needed::
 
@@ -17,6 +14,7 @@ Set explicitly when needed::
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 from typing import Any
@@ -41,11 +39,11 @@ def _discovery_fail_text() -> str:
         "To reach the cluster (after pods are up):\n"
         "  kubectl -n cuba port-forward svc/cuba-api 8080:80\n"
         "\n"
-        f"If the API is on a different port, set a full URL (or expand discovery):\n"
+        f"If the API is on a different port, set a full URL:\n"
         f"  CUBA_CHAT_URL=http://{_DISCOVERY_HOST}:<port>/v1/chat/completions "
         f"uv run python examples/chat_terminal.py\n"
-        f"  CUBA_CHAT_DISCOVERY_PORTS=8000,8080,9000   # try more ports in order\n"
     )
+
 
 _CANDIDATE_PORTS = [
     p.strip() for p in os.environ.get("CUBA_CHAT_DISCOVERY_PORTS", "8000,8080").split(",") if p.strip()
@@ -64,7 +62,6 @@ def _chat_to_base(url: str) -> str:
 
 
 def _discover_base() -> str:
-    """Return API base (scheme://host:port) that responds to GET /health with 2xx."""
     for port in _CANDIDATE_PORTS:
         base = f"http://{_DISCOVERY_HOST}:{port}"
         try:
@@ -77,7 +74,6 @@ def _discover_base() -> str:
 
 
 def _resolve_endpoint(client: httpx.Client) -> tuple[str, str]:
-    """Return (chat_completions_url, model_id)."""
     explicit = os.environ.get("CUBA_CHAT_URL", "").strip()
     if explicit:
         base = _chat_to_base(explicit)
@@ -88,10 +84,7 @@ def _resolve_endpoint(client: httpx.Client) -> tuple[str, str]:
             print(_EXPLICIT_FAIL, file=sys.stderr)
             raise SystemExit(1) from e
         if not h.is_success:
-            print(
-                f"{base}/health returned HTTP {h.status_code}. Fix the server or URL, then retry.",
-                file=sys.stderr,
-            )
+            print(f"{base}/health returned HTTP {h.status_code}.", file=sys.stderr)
             raise SystemExit(1)
         return explicit, _resolve_model(client, base, prefer_env=True)
 
@@ -100,8 +93,7 @@ def _resolve_endpoint(client: httpx.Client) -> tuple[str, str]:
         print(_discovery_fail_text(), file=sys.stderr)
         raise SystemExit(1)
 
-    url = f"{base}/v1/chat/completions"
-    return url, _resolve_model(client, base, prefer_env=True)
+    return f"{base}/v1/chat/completions", _resolve_model(client, base, prefer_env=True)
 
 
 def _resolve_model(client: httpx.Client, base: str, *, prefer_env: bool) -> str:
@@ -119,6 +111,70 @@ def _resolve_model(client: httpx.Client, base: str, *, prefer_env: bool) -> str:
     return os.environ.get("CUBA_MODEL", "cuba").strip() or "cuba"
 
 
+def _stream_response(client: httpx.Client, url: str, headers: dict[str, str], payload: dict[str, Any]) -> str:
+    """Stream SSE response, printing tokens as they arrive. Returns full assistant text.
+
+    Suppresses <think>...</think> blocks (Qwen3 chain-of-thought) from the display.
+    The full text including think blocks is kept in conversation history.
+    """
+    collected: list[str] = []
+    buf = ""          # rolling buffer for tag boundary detection
+    in_think = False  # currently inside a <think> block
+    OPEN, CLOSE = "<think>", "</think>"
+
+    with client.stream("POST", url, headers=headers, json=payload, timeout=300.0) as resp:
+        if resp.is_error:
+            body = resp.read().decode()
+            print(f"\nHTTP {resp.status_code}: {body}", file=sys.stderr)
+            return ""
+        for line in resp.iter_lines():
+            if not line.startswith("data: "):
+                continue
+            raw = line[6:]
+            if raw.strip() == "[DONE]":
+                break
+            try:
+                text = json.loads(raw)["choices"][0]["delta"].get("content") or ""
+            except (json.JSONDecodeError, KeyError, IndexError):
+                continue
+            if not text:
+                continue
+            collected.append(text)
+            buf += text
+
+            # Drain buffer: emit visible text, drop think blocks.
+            visible: list[str] = []
+            while buf:
+                if not in_think:
+                    idx = buf.find(OPEN)
+                    if idx == -1:
+                        # No opening tag in buffer — safe to flush all but last few chars
+                        # (guards against a tag split across two chunks)
+                        safe_end = max(0, len(buf) - len(OPEN) + 1)
+                        visible.append(buf[:safe_end])
+                        buf = buf[safe_end:]
+                        break
+                    visible.append(buf[:idx])
+                    buf = buf[idx + len(OPEN):]
+                    in_think = True
+                else:
+                    idx = buf.find(CLOSE)
+                    if idx == -1:
+                        buf = ""  # discard buffered think content
+                        break
+                    buf = buf[idx + len(CLOSE):].lstrip("\n")
+                    in_think = False
+
+            text_out = "".join(visible).lstrip("\n") if len(collected) <= 1 else "".join(visible)
+            if text_out:
+                print(text_out, end="", flush=True)
+
+    if buf and not in_think:
+        print(buf, end="", flush=True)
+    print()
+    return "".join(collected)
+
+
 def main() -> None:
     messages: list[dict[str, str]] = []
     headers = {"Authorization": f"Bearer {_API_KEY}"} if _API_KEY else {}
@@ -128,10 +184,11 @@ def main() -> None:
         base = _chat_to_base(url)
         parsed = urlparse(base)
         port = parsed.port or (80 if parsed.scheme == "http" else 443)
-        print(f"Using {url}")
+        print(f"Connected to {url}")
         if not os.environ.get("CUBA_CHAT_URL", "").strip():
-            print(f"  (auto-discovered via /health on port {port} among {_CANDIDATE_PORTS})")
-        print(f"model={model}\nType a line, Enter to send. 'q' to exit.\n")
+            print(f"  (auto-discovered on port {port})")
+        print(f"model={model}  max_tokens={_MAX_TOKENS}  streaming=on")
+        print("Type a message and press Enter. 'q' to quit.\n")
 
         while True:
             try:
@@ -146,48 +203,32 @@ def main() -> None:
                 break
 
             messages.append({"role": "user", "content": user})
+            print(" ", end="", flush=True)  # indent assistant reply
             try:
-                r = client.post(
-                    url,
-                    headers=headers,
-                    json={
+                reply = _stream_response(
+                    client, url, headers,
+                    {
                         "model": model,
                         "messages": messages,
                         "max_tokens": _MAX_TOKENS,
                         "temperature": _TEMPERATURE,
-                        "stream": False,
+                        "stream": True,
                     },
                 )
             except httpx.ConnectError as e:
-                print(f"ConnectError: {e}\n\n{_discovery_fail_text()}\n", file=sys.stderr)
+                print(f"\nConnectError: {e}", file=sys.stderr)
                 messages.pop()
                 continue
             except httpx.RequestError as e:
-                print(f"Request failed: {e}\n", file=sys.stderr)
+                print(f"\nRequest failed: {e}", file=sys.stderr)
                 messages.pop()
                 continue
 
-            if r.is_error:
-                print(r.status_code, r.text, file=sys.stderr)
+            if reply:
+                messages.append({"role": "assistant", "content": reply})
+            else:
                 messages.pop()
-                continue
-
-            try:
-                data = r.json()
-            except ValueError:
-                print("Invalid JSON:", r.text[:500], file=sys.stderr)
-                messages.pop()
-                continue
-
-            try:
-                text = data["choices"][0]["message"]["content"] or ""
-            except (KeyError, IndexError, TypeError):
-                print("Bad response:", data, file=sys.stderr)
-                messages.pop()
-                continue
-
-            print(f"{text}\n")
-            messages.append({"role": "assistant", "content": text})
+            print()
 
 
 if __name__ == "__main__":

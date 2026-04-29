@@ -138,7 +138,8 @@ def create_app(
     async def create_chat_completion(request: ChatCompletionRequest) -> Any:
         backend_o: OpenAIInferenceBackend = app.state.backend
         msg_dicts = [{"role": m.role, "content": m.content} for m in request.messages]
-        prompt = messages_to_prompt(msg_dicts)
+        tokenizer = getattr(backend_o, "tokenizer", None)
+        prompt = messages_to_prompt(msg_dicts, tokenizer=tokenizer)
         model = request.model
         max_t = int(request.max_tokens or 100)
         temp = float(request.temperature if request.temperature is not None else 0.7)

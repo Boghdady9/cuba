@@ -2,15 +2,16 @@
 
 A high-performance inference engine for serving large language models with continuous batching, dynamic scheduling, and OpenAI-compatible chat completions API.
 
-**Status**: Production-ready ✅ | Tests: 7/7 passing | Cleanup: Complete
+**Status**: Production-ready ✅ | Tests: 7/7 passing | Devices: CPU · CUDA · MPS · MLX
 
 ## Features
 
 - **Continuous Batching Engine**: Dynamically groups requests for efficient GPU/CPU utilization
+- **KV Cache**: Per-request key-value cache — O(n) decode instead of O(n²) re-forward
 - **OpenAI Chat Completions API**: Drop-in replacement for `POST /v1/chat/completions` with streaming support
-- **HuggingFace Integration**: Load any causal language model from HuggingFace Hub (GPT-2, Mistral, Llama, Gemma, etc.)
-- **Production Ready**: FastAPI + Uvicorn, comprehensive test coverage, Kubernetes/Argo deployment configs
-- **Async Scheduler**: Prioritizes decode work before new prefill to keep active generations moving
+- **HuggingFace Integration**: Load any causal language model from HuggingFace Hub (Qwen3, GPT-2, Mistral, Llama, etc.)
+- **Multi-device**: Auto-detects CUDA → MPS → CPU; MLX backend for Apple Silicon
+- **Production Ready**: FastAPI + Uvicorn, comprehensive test coverage, Docker + Kubernetes deployment
 
 ## Quick Start
 
@@ -225,15 +226,26 @@ kubectl -n cuba port-forward svc/cuba-api 8000:80
 curl http://127.0.0.1:8000/health
 ```
 
-### Argo Workflows
 
-```bash
-# Submit smoke test workflow
-argo submit argo/workflows/smoke-test.yaml --watch
+## Benchmarks
 
-# Submit benchmark workflow
-argo submit argo/workflows/benchmark.yaml --watch
-```
+Measured on **Intel MacBook Pro (x86_64, 8-core)**, model: `Qwen/Qwen3-0.6B`, single request, CPU-only.
+
+| Engine | Format | Quantization | tok/s | Notes |
+|--------|--------|-------------|-------|-------|
+| **llama.cpp** | GGUF Q8_0 | GGML INT8 | **37.6** | Hand-written AVX2/SIMD C++ kernels |
+| **Cuba** | HuggingFace | PyTorch INT8 | **~15** | KV cache + dynamic quantization |
+| **vLLM** | HuggingFace | — | — | CPU not supported (GPU-only) |
+
+**Why llama.cpp is faster on CPU:**
+llama.cpp uses hand-written AVX2/AVX512 SIMD kernels in C++ — the tightest possible CPU implementation. Cuba uses PyTorch INT8 dynamic quantization which has Python overhead and less aggressive SIMD usage.
+
+**Where Cuba wins:**
+- **Any HuggingFace model** — no GGUF conversion needed
+- **Continuous batching** — throughput scales with concurrent users (llama.cpp is single-request)
+- **OpenAI-compatible API** — drop-in replacement, streaming, chat templates
+- **Multi-device** — same code runs on CPU, CUDA, MPS, and MLX
+- **KV cache** — linear decode scaling, handles long sequences efficiently
 
 ## Performance Tuning
 
@@ -334,7 +346,6 @@ cuba/
 │   ├── chat_terminal.py     # Interactive CLI
 │   └── openai_client.py     # Python client example
 ├── k8s/                     # Kubernetes manifests
-├── argo/                    # Argo Workflows CI/CD
 ├── Dockerfile
 ├── cli_openai.py            # Server entry point
 ├── pyproject.toml

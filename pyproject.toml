@@ -19,7 +19,7 @@ dependencies = [
   "fastapi>=0.115.0",
   "uvicorn[standard]>=0.32.0",
   "httpx>=0.28.1",
-  "transformers==4.39.3",
+  "transformers>=4.51.0,<5.0.0",
   # NumPy 2.x breaks PyTorch wheels built against NumPy 1.x (e.g. torch 2.2.2 on macOS x86_64).
   "numpy>=1.26.0,<2.0",
 ]
@@ -33,6 +33,10 @@ client = [
 dev = [
     "pytest>=8.3.0",
     "anyio>=3.0",
+]
+# MLX backend for Apple Silicon (arm64 only).
+mlx = [
+    "mlx-lm>=0.21.0",
 ]
 
 [tool.setuptools.packages.find]

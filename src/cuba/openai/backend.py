@@ -4,13 +4,21 @@ OpenAI-style chat backends: stub for local testing and
 """
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
-from typing import Protocol
+from typing import Any, Protocol
 
 from cuba.engine.batching import ContinuousBatchingEngine
 
 
-def messages_to_prompt(messages: list[dict[str, str]]) -> str:
+def messages_to_prompt(messages: list[dict[str, str]], tokenizer: Any = None) -> str:
+    if tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
+        try:
+            return str(tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            ))
+        except Exception:  # noqa: BLE001
+            pass
     return "\n".join(f"{m.get('role', 'user')}: {m.get('content', '')}" for m in messages)
 
 
@@ -66,6 +74,10 @@ class ContinuousBatchingOpenAIBackend:
     def __init__(self, engine: ContinuousBatchingEngine) -> None:
         self._engine = engine
 
+    @property
+    def tokenizer(self) -> Any:
+        return self._engine.tokenizer
+
     async def start(self) -> None:
         await self._engine.start()
 
@@ -100,3 +112,69 @@ class ContinuousBatchingOpenAIBackend:
         )
         async for chunk in self._engine.stream_request(record.id):
             yield chunk
+
+
+class MLXOpenAIBackend:
+    """MLX-native backend for Apple Silicon. Bypasses the PyTorch engine entirely."""
+
+    def __init__(self, model: Any, tokenizer: Any) -> None:
+        self._model = model
+        self._tokenizer = tokenizer
+
+    @property
+    def tokenizer(self) -> Any:
+        return self._tokenizer
+
+    async def start(self) -> None:
+        pass
+
+    async def stop(self) -> None:
+        pass
+
+    def health(self) -> dict[str, object]:
+        return {"ready": True, "backend": "mlx"}
+
+    def _build_prompt(self, prompt: str) -> str:
+        return prompt
+
+    async def complete_chat(self, prompt: str, *, max_tokens: int, temperature: float) -> str:
+        from mlx_lm import generate
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: generate(
+                self._model, self._tokenizer,
+                prompt=prompt,
+                max_tokens=max_tokens,
+                temp=temperature,
+                verbose=False,
+            ),
+        )
+
+    async def stream_chat(self, prompt: str, *, max_tokens: int, temperature: float) -> AsyncIterator[str]:
+        from mlx_lm import stream_generate
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+        def _run() -> None:
+            try:
+                for token in stream_generate(
+                    self._model, self._tokenizer,
+                    prompt=prompt,
+                    max_tokens=max_tokens,
+                    temp=temperature,
+                ):
+                    # stream_generate yields TokenResponse objects or plain strings
+                    text = token.text if hasattr(token, "text") else str(token)
+                    asyncio.run_coroutine_threadsafe(queue.put(text), loop)
+            finally:
+                asyncio.run_coroutine_threadsafe(queue.put(None), loop)
+
+        import threading
+        threading.Thread(target=_run, daemon=True).start()
+
+        while True:
+            item = await queue.get()
+            if item is None:
+                break
+            yield item

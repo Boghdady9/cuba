@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 
 from cuba.metrics import MetricsCollector
 
@@ -21,7 +22,7 @@ class EngineConfig:
     max_concurrent_sequences: int = 32
     scheduler_tick_ms: int = 5
     device: str = "cpu"
-    # If True, mask EOS until `max_tokens` (toy in-memory model tests only; real models should stop at EOS).
+    # If True, mask EOS until `max_tokens` (toy in-memory model tests only).
     forbid_early_eos: bool = False
 
 
@@ -45,10 +46,50 @@ class RequestRecord:
     first_token_at: float | None = None
     completed_at: float | None = None
     error: str | None = None
+    # KV cache state (populated after prefill)
+    past_key_values: Any = field(default=None)
+    cache_len: int = 0
+    last_token_id: int | None = None
 
     @property
     def total_tokens(self) -> list[int]:
         return self.prompt_tokens + self.generated_token_ids
+
+
+def _pad_and_stack_kv(batch: list[RequestRecord], max_past: int, device: str) -> Any:
+    """Left-pad per-request KV caches to max_past and stack into a batched tensor.
+
+    HF shape per layer: (1, num_heads, seq_len, head_dim).
+    Returns: tuple of (key, value) per layer with shape (bsz, num_heads, max_past, head_dim).
+    """
+    if not batch or batch[0].past_key_values is None:
+        return None
+    num_layers = len(batch[0].past_key_values)
+    result = []
+    for layer_i in range(num_layers):
+        keys, vals = [], []
+        for req in batch:
+            k, v = req.past_key_values[layer_i]  # (1, heads, cache_len, head_dim)
+            pad = max_past - req.cache_len
+            if pad > 0:
+                # F.pad args go from last dim inward: (head_dim_r, head_dim_l, seq_r, seq_l)
+                k = F.pad(k, (0, 0, pad, 0))
+                v = F.pad(v, (0, 0, pad, 0))
+            keys.append(k)
+            vals.append(v)
+        result.append((torch.cat(keys, dim=0), torch.cat(vals, dim=0)))
+    return tuple(result)
+
+
+def _slice_kv(past: Any, req_idx: int, new_cache_len: int) -> Any:
+    """Extract one request's KV cache from a batched output, keeping last new_cache_len tokens."""
+    result = []
+    for k, v in past:
+        result.append((
+            k[req_idx : req_idx + 1, :, -new_cache_len:, :],
+            v[req_idx : req_idx + 1, :, -new_cache_len:, :],
+        ))
+    return tuple(result)
 
 
 class ContinuousBatchingEngine:
@@ -191,20 +232,21 @@ class ContinuousBatchingEngine:
                     active_sequences=len(self.active_requests),
                     scheduler_loop_seconds=self._last_scheduler_duration,
                 )
-            await asyncio.sleep(tick)
+            # Only yield to event loop when idle — avoids adding tick latency per token.
+            if not self.pending_prefill and not self.pending_decode:
+                await asyncio.sleep(tick)
 
     async def _run_one_iteration(self) -> None:
         self._promote_pending()
-        batch = self._build_batch()
-        if not batch:
-            return
-        inputs = self._build_batch_inputs(batch)
-        try:
-            outputs = await self._forward_batch(inputs)
-            await self._apply_outputs(batch, outputs)
-        except Exception as exc:  # noqa: BLE001
-            for req in batch:
-                await self._fail_request(req, exc)
+        # Decode-first: drain decode queue before processing new prefills.
+        if self.pending_decode:
+            batch = self._build_decode_batch()
+            if batch:
+                await self._process_decode_batch(batch)
+        else:
+            batch = self._build_prefill_batch()
+            if batch:
+                await self._process_prefill_batch(batch)
 
     def _promote_pending(self) -> None:
         while (
@@ -215,44 +257,158 @@ class ContinuousBatchingEngine:
             req.status = "running"
             self.active_requests[req.id] = req
 
-    def _build_batch(self) -> list[RequestRecord]:
+    def _build_decode_batch(self) -> list[RequestRecord]:
         batch: list[RequestRecord] = []
-
-        # Decode-first so long prompts do not starve active generations.
         while self.pending_decode and len(batch) < self.config.max_batch_size:
             req = self.pending_decode.popleft()
             if req.id in self.active_requests:
                 batch.append(req)
-
-        if len(batch) >= self.config.max_batch_size:
-            return batch
-
-        prefill_candidates = [
-            req for req in self.active_requests.values() if not req.prefill_done and req not in batch
-        ]
-        prefill_candidates.sort(key=lambda req: len(req.prompt_tokens), reverse=True)
-        for req in prefill_candidates:
-            if len(batch) >= self.config.max_batch_size:
-                break
-            batch.append(req)
         return batch
 
-    def _build_batch_inputs(self, batch: list[RequestRecord]) -> list[list[int]]:
-        # Causal LM needs full context each step (or KV cache; we use full re-forward).
-        inputs: list[list[int]] = []
-        for req in batch:
-            if not req.prefill_done:
-                inputs.append(req.prompt_tokens)
-            else:
-                inputs.append(req.prompt_tokens + req.generated_token_ids)
-        return inputs
+    def _build_prefill_batch(self) -> list[RequestRecord]:
+        candidates = [r for r in self.active_requests.values() if not r.prefill_done]
+        candidates.sort(key=lambda r: len(r.prompt_tokens), reverse=True)
+        return candidates[: self.config.max_batch_size]
 
-    async def _forward_batch(self, batch_inputs: list[list[int]]) -> Any:
-        max_len = max(len(seq) for seq in batch_inputs)
-        padded_inputs = [seq + [self.tokenizer.pad_token_id] * (max_len - len(seq)) for seq in batch_inputs]
-        input_tensor = torch.tensor(padded_inputs, device=self.device, dtype=torch.long)
-        with torch.inference_mode():
-            return self.model(input_tensor)
+    async def _process_prefill_batch(self, batch: list[RequestRecord]) -> None:
+        """Run prefill for each request individually (prompts differ in length)."""
+        now = time.perf_counter()
+        prompt_token_total = 0
+        for req in batch:
+            try:
+                input_ids = torch.tensor(
+                    [req.prompt_tokens], device=self.device, dtype=torch.long
+                )
+                attn_mask = torch.ones_like(input_ids)
+                with torch.inference_mode():
+                    out = self.model(input_ids, attention_mask=attn_mask, use_cache=True)
+
+                logits = out.logits[0, -1]
+                next_token = self._sample_token(logits, req)
+
+                req.past_key_values = out.past_key_values
+                req.cache_len = len(req.prompt_tokens)
+                req.last_token_id = next_token
+                req.prefill_done = True
+
+                req.generated_token_ids.append(next_token)
+                full_text = self._decode_generated(req.generated_token_ids)
+                chunk = full_text[len(req.last_stream_text):]
+                req.last_stream_text = full_text
+                req.generated_text_parts.append(chunk)
+                req.generated_tokens += 1
+                req.first_token_at = now
+                await req.token_queue.put(chunk)
+                prompt_token_total += len(req.prompt_tokens)
+
+                if req.generated_tokens >= req.max_tokens or (
+                    not self.config.forbid_early_eos
+                    and next_token == self.tokenizer.eos_token_id
+                ):
+                    await self._complete_request(req, now)
+                else:
+                    self.pending_decode.append(req)
+
+            except Exception as exc:  # noqa: BLE001
+                await self._fail_request(req, exc)
+
+        if self.metrics is not None:
+            self.metrics.record_scheduler_batch(
+                batch_size=len(batch),
+                prompt_tokens=prompt_token_total,
+                decode_tokens=0,
+            )
+
+    async def _process_decode_batch(self, batch: list[RequestRecord]) -> None:
+        """Run one decode step for all requests, batched with per-request KV caches."""
+        now = time.perf_counter()
+        bsz = len(batch)
+        max_past = max(req.cache_len for req in batch)
+
+        # (bsz, 1) — each request contributes its most recently sampled token
+        input_ids = torch.tensor(
+            [[req.last_token_id] for req in batch],
+            device=self.device, dtype=torch.long,
+        )
+        # Attention mask: zeros for left-padding, ones for valid positions
+        attn_mask = torch.zeros((bsz, max_past + 1), dtype=torch.long, device=self.device)
+        for i, req in enumerate(batch):
+            attn_mask[i, max_past - req.cache_len :] = 1
+
+        try:
+            past = _pad_and_stack_kv(batch, max_past, self.device)
+            with torch.inference_mode():
+                out = self.model(
+                    input_ids,
+                    attention_mask=attn_mask,
+                    past_key_values=past,
+                    use_cache=True,
+                )
+            for i, req in enumerate(batch):
+                req.past_key_values = _slice_kv(out.past_key_values, i, req.cache_len + 1)
+                req.cache_len += 1
+            logits_batch = out.logits[:, -1, :]  # (bsz, vocab)
+        except Exception:  # noqa: BLE001 — fall back to sequential per-request decode
+            logits_list = []
+            for req in batch:
+                in_single = torch.tensor(
+                    [[req.last_token_id]], device=self.device, dtype=torch.long
+                )
+                mask_single = torch.ones(
+                    (1, req.cache_len + 1), dtype=torch.long, device=self.device
+                )
+                with torch.inference_mode():
+                    out = self.model(
+                        in_single,
+                        attention_mask=mask_single,
+                        past_key_values=req.past_key_values,
+                        use_cache=True,
+                    )
+                req.past_key_values = out.past_key_values
+                req.cache_len += 1
+                logits_list.append(out.logits[0, -1])
+            logits_batch = torch.stack(logits_list)
+
+        for i, req in enumerate(batch):
+            next_token = self._sample_token(logits_batch[i], req)
+            req.last_token_id = next_token
+            req.generated_token_ids.append(next_token)
+            full_text = self._decode_generated(req.generated_token_ids)
+            chunk = (
+                full_text[len(req.last_stream_text):]
+                if full_text.startswith(req.last_stream_text)
+                else full_text
+            )
+            req.last_stream_text = full_text
+            req.generated_text_parts.append(chunk)
+            req.generated_tokens += 1
+            await req.token_queue.put(chunk)
+
+            if req.generated_tokens >= req.max_tokens or (
+                not self.config.forbid_early_eos
+                and next_token == self.tokenizer.eos_token_id
+            ):
+                await self._complete_request(req, now)
+            else:
+                self.pending_decode.append(req)
+
+        if self.metrics is not None:
+            self.metrics.record_scheduler_batch(
+                batch_size=len(batch),
+                prompt_tokens=0,
+                decode_tokens=len(batch),
+            )
+
+    async def _complete_request(self, req: RequestRecord, now: float) -> None:
+        req.status = "completed"
+        req.completed_at = now
+        final_text = self._decode_generated(req.generated_token_ids)
+        if req.completion is not None and not req.completion.done():
+            req.completion.set_result(final_text)
+        await self._emit_terminal(req)
+        self.active_requests.pop(req.id, None)
+        self._recent_completed.append(req)
+        self.completed_sequences.append(self._snapshot_request(req))
 
     def _decode_generated(self, token_ids: list[int]) -> str:
         dec = self.tokenizer.decode
@@ -260,53 +416,6 @@ class ContinuousBatchingEngine:
             return str(dec(token_ids, skip_special_tokens=True))  # type: ignore[call-arg]
         except TypeError:
             return str(dec(token_ids))
-
-    async def _apply_outputs(self, batch: list[RequestRecord], outputs: Any) -> None:
-        now = time.perf_counter()
-        prompt_token_total = 0
-        decode_token_total = 0
-        for index, req in enumerate(batch):
-            logits = outputs.logits[index, -1]
-            next_token = self._sample_token(logits, req)
-
-            req.prefill_done = True
-            req.generated_token_ids.append(next_token)
-            full_text = self._decode_generated(req.generated_token_ids)
-            if full_text.startswith(req.last_stream_text):
-                chunk = full_text[len(req.last_stream_text) :]
-            else:
-                # Rare tokenizer edge: emit full new string (re-sync stream)
-                chunk = full_text
-            req.last_stream_text = full_text
-            req.generated_text_parts.append(chunk)
-            req.generated_tokens += 1
-            if req.first_token_at is None:
-                req.first_token_at = now
-            await req.token_queue.put(chunk)
-
-            if req.generated_tokens >= req.max_tokens or next_token == self.tokenizer.eos_token_id:
-                req.status = "completed"
-                req.completed_at = now
-                if req.completion is not None and not req.completion.done():
-                    req.completion.set_result(self._decode_generated(req.generated_token_ids))
-                await self._emit_terminal(req)
-                self.active_requests.pop(req.id, None)
-                self._recent_completed.append(req)
-                self.completed_sequences.append(self._snapshot_request(req))
-            else:
-                self.pending_decode.append(req)
-
-            if len(req.generated_token_ids) == 1:
-                prompt_token_total += len(req.prompt_tokens)
-            else:
-                decode_token_total += 1
-
-        if self.metrics is not None:
-            self.metrics.record_scheduler_batch(
-                batch_size=len(batch),
-                prompt_tokens=prompt_token_total,
-                decode_tokens=decode_token_total,
-            )
 
     async def _emit_terminal(self, req: RequestRecord, error: str | None = None) -> None:
         if error is not None:
@@ -336,7 +445,7 @@ class ContinuousBatchingEngine:
         }
 
     def _mask_unsampleable(self, logits: torch.Tensor, req: RequestRecord) -> torch.Tensor:
-        """Block pad / bos. Optionally block EOS (toy engine) so runs hit ``max_tokens``."""
+        """Block pad / bos. Optionally block EOS (toy engine) so runs hit max_tokens."""
         out = logits.clone()
         m = torch.finfo(out.dtype).min
         tok = self.tokenizer
