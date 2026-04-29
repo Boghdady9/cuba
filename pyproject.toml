@@ -1,0 +1,47 @@
+# PyTorch: macOS Intel (x86_64) wheels stop at 2.2.2; there are no 2.3+ pip wheels. Use Python 3.12
+# on Intel Mac for torch. On Apple Silicon, use arm64 Python (not Rosetta/x86_64) for latest torch
+# and you can use 3.13+ (`arch -arm64` / native uv Python).
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cuba"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "torch==2.2.2; platform_system == 'Darwin' and platform_machine == 'x86_64'",
+  "torch>=2.6.0; platform_system == 'Darwin' and platform_machine == 'arm64'",
+  "torch>=2.6.0; platform_system == 'Linux'",
+  "torch>=2.6.0; platform_system == 'Windows'",
+  "fastapi>=0.115.0",
+  "uvicorn[standard]>=0.32.0",
+  "httpx>=0.28.1",
+  "transformers==4.39.3",
+  # NumPy 2.x breaks PyTorch wheels built against NumPy 1.x (e.g. torch 2.2.2 on macOS x86_64).
+  "numpy>=1.26.0,<2.0",
+]
+
+[project.optional-dependencies]
+# Official OpenAI Python client for ``examples/openai_client.py`` and local integration tests.
+client = [
+    "openai>=1.0.0",
+]
+# Development and testing dependencies.
+dev = [
+    "pytest>=8.3.0",
+    "anyio>=3.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.mypy]
+python_version = "3.12"
+# So third-party packages installed in the project venv (e.g. torch) resolve when analyzing from the repo root
+python_executable = ".venv/bin/python"
+explicit_package_bases = true
+mypy_path = "src"
+namespace_packages = true

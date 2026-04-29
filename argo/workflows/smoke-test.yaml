@@ -1,0 +1,27 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: cuba-smoke-test-
+  namespace: argo
+spec:
+  # Use the executor SA from install.yaml (not "default" — that SA cannot create WorkflowTaskResult).
+  serviceAccountName: argo
+  entrypoint: smoke
+  arguments:
+    parameters:
+      - name: target-url
+        value: http://cuba-api.cuba.svc.cluster.local
+  templates:
+    - name: smoke
+      container:
+        image: curlimages/curl:8.12.1
+        command: [sh, -c]
+        args:
+          - >
+            set -euo pipefail;
+            curl -sf "{{workflow.parameters.target-url}}/health";
+            curl -sf "{{workflow.parameters.target-url}}/ready";
+            curl -sf "{{workflow.parameters.target-url}}/v1/models";
+            curl -sf "{{workflow.parameters.target-url}}/v1/chat/completions"
+            -H 'content-type: application/json'
+            -d '{"model":"cuba","messages":[{"role":"user","content":"hello"}],"max_tokens":4,"temperature":0}';

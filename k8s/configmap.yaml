@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cuba-api-config
+  namespace: cuba
+data:
+  CUBA_BACKEND: "engine"
+  CUBA_MODEL_NAME: "cuba"
+  MAX_BATCH_SIZE: "16"
+  CUBA_MAX_WAIT_MS: "10"
+  CUBA_MAX_CONCURRENT_SEQUENCES: "32"
+  CUBA_SCHEDULER_TICK_MS: "5"
+  # MODEL_PATH must be set via Secret or environment variable: e.g. "google/gemma-3-270m"
